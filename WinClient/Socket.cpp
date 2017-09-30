@@ -1,50 +1,128 @@
-﻿#include "Socket.h"
+#include "Socket.h"
+
+Socket::Socket() 
+{
+	m_pConnectSocket = NULL;
+	m_ServerState = false;
+}
 
 bool Socket::Init()
 {
 	WSADATA wsaData;
-	struct addrinfo *result = NULL,
-		*ptr = NULL,
-		hints;
+	struct addrinfo *result = NULL, hints;
 	int iResult;
 
-	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (iResult != 0) {
+	if ((iResult = WSAStartup(MAKEWORD(2, 2), &wsaData)) != 0)
+	{
 		printf("WSAStartup failed with error: %d\n", iResult);
 		return false;
 	}
 
 	ZeroMemory(&hints, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
+	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
 
-	iResult = getaddrinfo(SERVER, PORT, &hints, &result);
-	if (iResult != 0) {
-		printf("getaddrinfo failed with error: %d\n", iResult);
+	if (getaddrinfo(SERVER, PORT, &hints, &result) != 0)
+	{
+		PrintErrorMsg();
 		WSACleanup();
 		return false;
 	}
 
-	for (ptr = result; ptr != NULL; ptr = ptr->ai_next) {
-		m_ConnectSocket = socket(ptr->ai_family, ptr->ai_socktype,
-			ptr->ai_protocol);
-		if (m_ConnectSocket == INVALID_SOCKET) {
-			printf("socket failed with error: %ld\n", WSAGetLastError());
-			WSACleanup();
-			return false;
-		}
-
-		iResult = connect(m_ConnectSocket, ptr->ai_addr, (int)ptr->ai_addrlen);
-		if (iResult == SOCKET_ERROR) {
-			closesocket(m_ConnectSocket);
-			m_ConnectSocket = INVALID_SOCKET;
-			continue;
-		}
-		break;
+	if ((m_pConnectSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol)) == INVALID_SOCKET)
+	{
+		PrintErrorMsg();
+		WSACleanup();
+		return false;
 	}
-	std::cout << "Connected!" << std::endl;
+
+	if ((iResult = connect(m_pConnectSocket, result->ai_addr, (int)result->ai_addrlen)) == SOCKET_ERROR)
+	{
+		PrintErrorMsg();
+		closesocket(m_pConnectSocket);
+		return false;
+	}
 	return true;
+}
+
+void Socket::Process(Packet packet)
+{
+	switch (packet.byType)
+	{
+	case S2C_MESSAGE:
+	{
+		char* pMessage;
+		ReadPacket(packet.data, "s", &pMessage);
+		printf("Nachricht: %s\n", pMessage);
+	}
+	break;
+	case S2C_DOCUMENT:
+	{
+		int bSize = 0;
+		char* pName = NULL;
+		ReadPacket(packet.data, "bs", &bSize, &pName);
+		ReadInFile(bSize, pName);
+	}
+	break;
+	case S2C_STATE:
+	{
+		ReadPacket(packet.data, "b", &m_ServerState);
+		std::cout << "Server is ready to receive. Notifying" << std::endl;
+		m_Cv.notify_all();
+	}
+	break;
+	}
+}
+
+void Socket::InteractionLoop()
+{
+	std::string buffer;
+	while (true)
+	{
+		std::cout << "Options: send file / send message / quit to exit" << std::endl;
+		getline(std::cin, buffer);
+		if (buffer == "send file")
+		{
+			OPENFILENAME ofn;
+			wchar_t File[260];
+			HWND hwnd = NULL;
+			HANDLE hf = NULL;
+
+			ZeroMemory(&ofn, sizeof(ofn));
+			ofn.lStructSize = sizeof(ofn);
+			ofn.hwndOwner = hwnd;
+			ofn.lpstrFile = File;
+			ofn.lpstrFile[0] = '\0';
+			ofn.nMaxFile = sizeof(File);
+			ofn.lpstrFilter = L"All\0*.*\0Text\0*.TXT\0";
+			ofn.nFilterIndex = 1;
+			ofn.lpstrFileTitle = NULL;
+			ofn.nMaxFileTitle = 0;
+			ofn.lpstrInitialDir = NULL;
+			ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+			if (GetOpenFileName(&ofn) == true)	
+				SendFile(ws2s(std::wstring(ofn.lpstrFile)));
+		}
+		else if (buffer == "send message")
+		{
+			std::string msg;
+			std::cout << "Put in your message" << std::endl;
+			getline(std::cin, msg);
+			SendPacket(C2S_MESSAGE, "s",  msg.c_str());
+		}
+		else if (buffer == "quit")
+		{
+			closesocket(m_pConnectSocket);
+			return;
+		}
+		else
+		{
+			std::cout << "Wrong input" << std::endl;
+		}
+		printf("\n");
+	}
 }
 
 char* Socket::WritePacket(char* packet, va_list va)
@@ -57,12 +135,11 @@ char* Socket::WritePacket(char* packet, va_list va)
 		case 'B':
 			*(int *)packet = va_arg(va, int);
 			packet += sizeof(int);
-		break;
+			break;
 		case 's':
 		case 'S':
 		{
 			char *str = va_arg(va, char *);
-			printf("*str: %s\n", str);
 			if (str == 0 || *str == 0) {
 				*packet++ = 0;
 				break;
@@ -101,7 +178,7 @@ char* Socket::ReadPacket(char* packet, const char* format, ...)
 		case 'b':
 			*va_arg(va, int*) = *(int *)packet;
 			packet += sizeof(int);
-		break;
+			break;
 		case 's':
 		{
 			char *text = *va_arg(va, char**) = packet;
@@ -133,32 +210,29 @@ bool Socket::SendPacket(BYTE byType, ...)
 
 	packet.bSize = end - (char*)&packet;
 
-	int bSentCount = send(m_ConnectSocket, (char*)&packet, packet.bSize, 0);
-	if (bSentCount <= 0)
-		return false;
+	if (send(m_pConnectSocket, (char*)&packet, packet.bSize, 0) == SOCKET_ERROR)
+	{
+		closesocket(m_pConnectSocket);
+		WSACleanup();
 
+		return false;
+	}
 	return true;
 }
 
 void Socket::RecvLoop()
 {
+	int bLen = 0;
+	PACKETBUFFER pBuffer;
 	while (true)
 	{
-		PACKETBUFFER pBuffer;
-		memset(&pBuffer, 0, sizeof(PACKETBUFFER));
-
-		int bLen = recv(m_ConnectSocket, pBuffer, sizeof(PACKETBUFFER), 0);
-		if (bLen <= 0)
+		if ((bLen = recv(m_pConnectSocket, pBuffer, sizeof(PACKETBUFFER), 0)) == SOCKET_ERROR)
 		{
-			std::cout << "Socket-recv error" << std::endl;
-			closesocket(m_ConnectSocket);
-			WSACleanup;
-
+			PrintErrorMsg();
+			closesocket(m_pConnectSocket);
+			WSACleanup();
 			break;
 		}
-		printf("Got a package\n");
-
-		if (bLen > MAX_PACKET_LENGTH) continue;
 
 		char* p = pBuffer;
 		while (bLen > 0 && bLen >= *(int*)p)
@@ -168,6 +242,11 @@ void Socket::RecvLoop()
 			//copying packet into new Packet
 			memcpy(&packet, p, *(int*)p);
 
+			if (packet.byType == S2C_DISCONNECT)
+			{
+				std::cerr << "The server went offline. Closing" << std::endl;
+				return;
+			}
 			Process(packet);
 
 			// length left to read is lessen by the last packet size
@@ -178,89 +257,114 @@ void Socket::RecvLoop()
 	}
 }
 
-void Socket::SendFile(const char* name)
+void Socket::SendFile(std::string name)
 {
-	std::cout << "Name: " << name << std::endl;
-	FILE *pFile = fopen(name, "rb");
-	if (pFile == NULL)
-	{
-		printf("pfile is null\n");
-		return;
-	}
-
-	fseek(pFile, 0, SEEK_END);
-	int bLen = ftell(pFile);
-	fseek(pFile, 0, SEEK_SET);
-	char* p_Buffer = new char[bLen];
-	fread(p_Buffer, 1, bLen, pFile);
-	fclose(pFile);
-
-	SendPacket(DOCUMENT, "bs", bLen, name);
-	printf("Len sent: %d \n", bLen);
-
+	FILE *pFile;
+	errno_t err;
 	int bOffset = 0;
 	int bSentCount = 0;
+	int bReadCount = 0;
+	int bTotal = 0;
+	char Buffer[BUFFERSIZE];
 
-	while (bOffset < bLen)
+	if ((err = fopen_s(&pFile, name.c_str(), "rb")) != NULL)
 	{
-		bSentCount = send(m_ConnectSocket, p_Buffer + bOffset, bLen - bOffset, 0);
-		if (bSentCount <= 0)
-			return;
-		printf("Sending file data\n");
-		bOffset += bSentCount;
+		std::cerr << "Unable to open file: " << name << " Error: " << strerror(err) << std::endl;
+		return;
 	}
+	
+	fseek(pFile, 0, SEEK_END);
+	int bLen = ftell(pFile);
+	rewind(pFile);
+
+	if (!SendPacket(C2S_DOCUMENT, "bs", bLen, GetFileName(name).c_str()))
+	{
+		fclose(pFile);
+		std::cerr << "Unable to send Document Information. Not going to send file" << std::endl;
+		std::cerr << "Error Message: "; PrintErrorMsg();
+		return;
+	}
+	std::unique_lock<std::mutex>lk(m_Mtx);
+	m_Cv.wait(lk);
+	if (m_ServerState)
+	{
+		do
+		{
+			bOffset = 0;
+			bReadCount = fread(Buffer, sizeof(char), BUFFERSIZE, pFile);
+			while (bOffset < bReadCount)
+			{
+				if ((bSentCount = send(m_pConnectSocket, Buffer, bReadCount - bOffset, 0)) == SOCKET_ERROR)
+				{
+					PrintErrorMsg();
+					closesocket(m_pConnectSocket);
+					WSACleanup();
+					fclose(pFile);
+					return;
+				}
+				bOffset += bSentCount;
+				bTotal += bSentCount;
+			}
+		} while (bReadCount == BUFFERSIZE);
+		printf("Bytes sent: %d\n", bTotal);
+	}
+	else
+	{
+		std::cout << "A serverside error occured. Will not send data" << std::endl;
+	}
+	fclose(pFile);
 }
 
 void Socket::ReadInFile(int size, char* name)
 {
-	int bOffset = 0;
+	printf("About to receive file of Size: %d Bytes\n", size);
 	int bRecvCount = 0;
-	char* pBuffer = new char[size];
+	int bReceived = 0;
+	char Buffer[BUFFERSIZE];
 	FILE* pFile;
+	errno_t err;
 
-	while (bOffset < size)
+	if ((err = fopen_s(&pFile, name, "rb")) != 0)
 	{
-		bRecvCount = recv(m_ConnectSocket, pBuffer + bOffset, size - bOffset, 0);
-		if (bRecvCount <= 0)
+		fprintf_s(stderr, "cannot open file '%s': %s\n", name, strerror(err));
+		SendPacket(C2S_STATE, "b", false);
+		return;
+	}
+	SendPacket(C2S_STATE, "b", true);
+	do
+	{
+		if ((bRecvCount = recv(m_pConnectSocket, Buffer, BUFFERSIZE, 0)) == SOCKET_ERROR)
+		{
+			PrintErrorMsg();
+			closesocket(m_pConnectSocket);
+			WSACleanup();
+			fclose(pFile);
 			return;
-
-		bOffset += bRecvCount;
-	}
-
-	pFile = fopen(name, "wb");
-	fwrite(pBuffer, 1, size, pFile);
+		}
+		fwrite(Buffer, 1, bRecvCount, pFile);
+		bReceived += bRecvCount;
+	} while (bReceived < size);
+	std::cout << "File has been successfully received" << std::endl;
 	fclose(pFile);
-}
-
-void Socket::Process(Packet packet)
-{
-	switch (packet.byType)
-	{
-	case MESSAGE:
-		char* pMessage;
-		ReadPacket(packet.data, "s", &pMessage);
-		printf("Nachricht: %s\n", pMessage);
-		break;
-	case TEST:
-		char* pTestMsg;
-		int bNumber;
-		ReadPacket(packet.data, "sb", &pTestMsg, &bNumber);
-		printf("Testmsg %s\n", pTestMsg);
-		printf("Testnumber %d\n", bNumber);
-		break;
-	case DOCUMENT:
-		int bSize = 0;
-		char* pName = NULL;
-		ReadPacket(packet.data, "bs", &bSize, &pName);
-		ReadInFile(bSize, pName);
-		break;
-	}
 }
 
 DWORD Socket::ThreadStart(LPVOID lParam)
 {
 	Socket *pSocket = (Socket*)lParam;
-	pSocket->RecvLoop();
+	pSocket->InteractionLoop();
 
 	return 0;
+}
+
+void Socket::PrintErrorMsg()
+{
+	LPWSTR errString = NULL;
+	FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+		NULL,
+		WSAGetLastError(),
+		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
+		(LPWSTR)&errString, 0, NULL);
+
+	std::wcout << errString << std::endl;
+	HeapFree(GetProcessHeap(), 0, errString);
 }
